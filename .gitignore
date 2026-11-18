@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+
+# Test snapshots
+*.pkl
+
+# Thesis drafts and Office lock files (not needed to run the app)
+*.docx
+~$*

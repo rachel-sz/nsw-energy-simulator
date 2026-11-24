@@ -16,6 +16,13 @@ DATA_FILES = {
 
 GEN_PROFILE_FILE = os.path.join(_DATA_DIR, "nsw_2023_clean.csv")
 
+# 2030/2040 solar and wind output per MW: AEMO 2024 ISP zone traces (2018 weather),
+# average of N2, N3, N5 and N9 (solar: single-axis tracking; wind: high-quality onshore)
+SOLAR_WIND_TRACE_FILES = {
+    2030: os.path.join(_DATA_DIR, "nsw_solar_wind_2030_isp2024_ref2018.csv"),
+    2040: os.path.join(_DATA_DIR, "nsw_solar_wind_2040_isp2024_ref2018.csv"),
+}
+
 #---------------------------------------------------------------------------------------------------------------
 # Emissions (kg CO2-e/MWh), Scope 1
 # Gas and coal: average of NSW stations (AEMO IASR)
@@ -67,13 +74,13 @@ BASELINE_CAPACITY = {
         "BlackCoal": 8335,
         "Battery": 200,
     },
-    2030: {
-        "Solar": 9945,
-        "Wind": 7783,
+    2030: {                     # 2029-30 column (solar, wind and coal corrected from the 2028-29 values)
+        "Solar": 15633,
+        "Wind": 10147,
         "Hydro": 2670,
         "PumpedHydro": 2202,    # Snowy 2.0
         "Gas": 3232,
-        "BlackCoal": 5465,      # Eraring closes 2027
+        "BlackCoal": 4145,
         "Battery": 11377,
     },
     2040: {
@@ -91,16 +98,16 @@ BASELINE_CAPACITY = {
 # Battery storage
 #---------------------------------------------------------------------------------------------------------------
 
-BATTERY_DURATION_H = {      # Storage hours
-    2023: 2,
-    2030: 4,
-    2040: 8,
-}
-
 BATTERY_BASELINE_MWH = {
     2023: 375,      # Baseline Capacities sheet
-    2030: 45508,    # 11,377 MW × 4 h
-    2040: 94440,    # 11,805 MW × 8 h
+    2030: 46343,    # 2026 ISP shallow + medium storage energy (14,501 + 31,843 MWh)
+    2040: 44923,    # 2026 ISP shallow + medium storage energy (11,781 + 33,143 MWh)
+}
+
+BATTERY_DURATION_H = {      # Storage hours
+    2023: BATTERY_BASELINE_MWH[2023] / BASELINE_CAPACITY[2023]["Battery"],    # 375 / 200 = ~1.9 h
+    2030: BATTERY_BASELINE_MWH[2030] / BASELINE_CAPACITY[2030]["Battery"],    # ~4.1 h
+    2040: BATTERY_BASELINE_MWH[2040] / BASELINE_CAPACITY[2040]["Battery"],    # ~3.8 h
 }
 
 BATTERY_EFFICIENCY = 0.85       # Round trip
@@ -111,11 +118,13 @@ BATTERY_EFFICIENCY = 0.85       # Round trip
 
 SNOWY_2 = {"mw": 2202, "hours": 359660 / 2202}     # From 2030
 
-PUMPED_HYDRO_NEW_DURATION_H = 24        # New pumped hydro entrants have 24 h storage
+ISP_DEEP_STORAGE_DURATION_H = 9720 / 810   # 2040 ISP deep storage beyond Shoalhaven: 810 MW, 9,720 MWh (~12 h)
+
+PUMPED_HYDRO_NEW_DURATION_H = 24        # Pumped hydro added by the user has 24 h storage
 
 PUMPED_HYDRO_EFFICIENCY = 0.76          # Round trip
 
-PUMPED_HYDRO_PEAK_HOURS = (16, 22)      # From 4pm to 10pm, dispatched before coal and gas; other times held in reserve
+PUMPED_HYDRO_LOOKAHEAD_DAYS = 7         # Before coal and gas, deep storage uses only water above the shortfall forecast over the next 7 days
 
 #---------------------------------------------------------------------------------------------------------------
 # NSW coal fleet
@@ -136,6 +145,21 @@ COAL_RAMP_MW_PER_MIN = {
     2023: 5.367,
     2030: 5.55,
     2040: 6.0,
+}
+
+# Gas ramp limit: how fast the gas fleet can increase output, as a share of fleet capacity per minute.
+# Sum of each station's maximum ramp up (MW/min, full data, Gas sheet) divided by the baseline gas capacity:
+#   2023: Tallawarra 28 + Colongra 13 + Smithfield 24.7 + Uranquinty 14 = 79.7 MW/min over 2,041 MW
+#         (the 2024 table gives only Tallawarra, so the same stations' 2030 rates are used)
+#   2030: the four above + Hunter 40 + Tallawarra 2 33 = 152.7 MW/min over 3,232 MW
+#   2040: existing stations 153.0 MW/min (2040 rates) for 3,232 MW, plus the 3,240 MW of new gas at the
+#         existing fleet's 2030 rate per MW (new-entrant unit sizes are not given)
+# Scaling by capacity keeps the limit in step with the gas slider.
+_GAS_RAMP_2030 = 152.7 / 3232
+GAS_RAMP_SHARE_PER_MIN = {
+    2023: 79.7 / 2041,
+    2030: _GAS_RAMP_2030,
+    2040: (153.0 + _GAS_RAMP_2030 * (6472 - 3232)) / 6472,
 }
 
 # Unplanned outages (2030 and 2040): 1 − full outage rate − partial outage rate × derating factor
@@ -285,6 +309,27 @@ GAS_FUEL = {        # Average of NSW gas stations
 }
 
 NUCLEAR_FUEL = (0.6, 3.6 / 0.33)    # Large-scale nuclear; heat rate = 3.6 GJ/MWh / 33% efficiency
+
+#-----------------------------------------------
+# Inflation: convert 2023 values to 2025 dollars
+# 2023 costs are published in real 2023 dollars (2023 IASR); 2030/2040 costs in real 2025 dollars (2025 IASR)
+# Factor = CPI rise June 2023 to June 2025 = 1.038 x 1.021 (ABS CPI, June quarters 2024 and 2025)
+#-----------------------------------------------
+
+CPI_2023_TO_2025 = 1.038 * 1.021
+
+
+def _to_2025_dollars(values):
+    if isinstance(values, dict):
+        return {key: _to_2025_dollars(value) for key, value in values.items()}      # storage costs by duration
+    return values * CPI_2023_TO_2025
+
+
+for _table in (CAPEX, FIXED_OPEX, VARIABLE_OPEX, NEW_FIXED_OPEX, NEW_VARIABLE_OPEX):
+    _table[2023] = _to_2025_dollars(_table[2023])
+
+COAL_FUEL[2023] = (COAL_FUEL[2023][0] * CPI_2023_TO_2025, COAL_FUEL[2023][1])     # price only, not heat rate
+GAS_FUEL[2023] = (GAS_FUEL[2023][0] * CPI_2023_TO_2025, GAS_FUEL[2023][1])
 
 #---------------------------------------------------------------------------------------------------------------
 # 2023 capacity still within its economic life (MW), for capital costs

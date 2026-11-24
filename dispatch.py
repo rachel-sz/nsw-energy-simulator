@@ -1,22 +1,31 @@
 import numpy as np
 import pandas as pd
 from Config import (BASELINE_CAPACITY, BATTERY_DURATION_H, BATTERY_EFFICIENCY, COAL_AVAILABILITY, COAL_AVG_UNIT_MW,
-                    COAL_MIN_STABLE_PER_UNIT, COAL_RAMP_MW_PER_MIN,
-                    PUMPED_HYDRO_EFFICIENCY, PUMPED_HYDRO_NEW_DURATION_H, PUMPED_HYDRO_PEAK_HOURS, SNOWY_2)
+                    COAL_MIN_STABLE_PER_UNIT, COAL_RAMP_MW_PER_MIN, GAS_RAMP_SHARE_PER_MIN,
+                    ISP_DEEP_STORAGE_DURATION_H, PUMPED_HYDRO_EFFICIENCY, PUMPED_HYDRO_LOOKAHEAD_DAYS,
+                    PUMPED_HYDRO_NEW_DURATION_H, SNOWY_2)
 
 from costs import calculate_costs
 
 INTERVAL_HOURS = 0.5        # each step is half an hour
 
 #---------------------------------------------------------------------------------------------------------------
-# Year data: 2023 generation profile with the chosen year's demand
+# Year data: the chosen year's demand, solar and wind, with hydro and coal from the 2023 profile
 #---------------------------------------------------------------------------------------------------------------
 
 def _calendar_key(timestamps):      # month, day and time of day
     return pd.to_datetime(timestamps).dt.strftime("%m-%d %H:%M")
 
 
-def build_year_dataframe(year, gen_profile, demand_trace):
+def _match(df, trace, column, year):     # take a trace column for each half-hour, matched on day and time of day
+    values = pd.Series(trace[column].values, index=_calendar_key(trace["datetime"]))
+    matched = _calendar_key(df["Time-ending"]).map(values)
+    if matched.isna().any():    # error check: every half-hour needs a value
+        raise ValueError(f"{year} {column} trace is missing {matched.isna().sum()} half-hours")
+    return matched.values
+
+
+def build_year_dataframe(year, gen_profile, demand_trace, solar_wind_trace=None):
     df = gen_profile.copy()
 
     if year == 2023:    # 2023 generation and demand line up already
@@ -24,13 +33,13 @@ def build_year_dataframe(year, gen_profile, demand_trace):
         return df
 
     df["Time-ending"] = df["Time-ending"] + pd.DateOffset(years=year - 2023)     # move dates to 2030 or 2040
+    df["DEMAND_MW"] = _match(df, demand_trace, "demand_mw", year)
 
-    # Match generation and demand on day and time of day
-    trace_demand = pd.Series(demand_trace["demand_mw"].values, index=_calendar_key(demand_trace["datetime"]))
-    df["DEMAND_MW"] = _calendar_key(df["Time-ending"]).map(trace_demand).values
-
-    if df["DEMAND_MW"].isna().any():    # error check: every half-hour needs a demand value
-        raise ValueError(f"{year} demand trace is missing {df['DEMAND_MW'].isna().sum()} half-hours")
+    # Solar and wind: output per MW from the AEMO traces, stored as if it came from the 2023 fleet,
+    # so run_dispatch's scaling (user MW ÷ 2023 MW) gives trace × user MW
+    if solar_wind_trace is not None:
+        df["Solar_MW"] = _match(df, solar_wind_trace, "solar_cf", year) * BASELINE_CAPACITY[2023]["Solar"]
+        df["Wind_MW"] = _match(df, solar_wind_trace, "wind_cf", year) * BASELINE_CAPACITY[2023]["Wind"]
     return df
 
 #---------------------------------------------------------------------------------------------------------------
@@ -42,19 +51,19 @@ def calculate_coal_minimum(coal_capacity_mw, year):
     return n_units * COAL_MIN_STABLE_PER_UNIT[year]
 
 #---------------------------------------------------------------------------------------------------------------
-# Pumped hydro storage (MWh)
-# Snowy 2.0 (from 2030) has ~163 h of storage; other pumped hydro has 24 h
+# Deep storage (pumped hydro) energy (MWh), filled in this order:
+#   Snowy 2.0 (from 2030): ~163 h
+#   ISP new deep storage (the rest of the year's baseline, 2040): ~12 h
+#   pumped hydro added by the user: 24 h
 #---------------------------------------------------------------------------------------------------------------
 
 def pumped_hydro_storage(pumped_mw, year):
-    if year >= 2030:
-        snowy_mw = min(pumped_mw, SNOWY_2["mw"])
-    else:
-        snowy_mw = 0        # Snowy 2.0 is only available from 2030
+    snowy_mw = min(pumped_mw, SNOWY_2["mw"]) if year >= 2030 else 0       # Snowy 2.0 is only available from 2030
+    isp_deep_mw = min(pumped_mw, BASELINE_CAPACITY[year]["PumpedHydro"]) - snowy_mw
+    added_mw = pumped_mw - snowy_mw - isp_deep_mw
 
-    other_mw = pumped_mw - snowy_mw
-
-    return snowy_mw * SNOWY_2["hours"] + other_mw * PUMPED_HYDRO_NEW_DURATION_H
+    return (snowy_mw * SNOWY_2["hours"] + isp_deep_mw * ISP_DEEP_STORAGE_DURATION_H
+            + added_mw * PUMPED_HYDRO_NEW_DURATION_H)
 
 #---------------------------------------------------------------------------------------------------------------
 # Dispatch: meets demand in each half-hour using the merit order
@@ -104,21 +113,27 @@ def run_dispatch(df, capacity_additions, source_toggles, battery_capacity_mwh, y
     battery_stored = battery_capacity_mwh * 0.5         # starts half full
 
 #-----------------------------------------------
-# Pumped hydro: power (MW), storage (MWh) and evening peak window
+# Deep storage (pumped hydro): power (MW) and storage (MWh)
 #-----------------------------------------------
     pumped_mw = _user_mw("PumpedHydro", "pumped_hydro")
     pumped_mwh = pumped_hydro_storage(pumped_mw, year)
     pumped_stored = pumped_mwh * 0.5                    # starts half full
 
-    # Pumped hydro runs before coal and gas only in these hours
-    peak_start, peak_end = PUMPED_HYDRO_PEAK_HOURS
-    hours = df["Time-ending"].dt.hour.values
-    is_peak = (hours >= peak_start) & (hours < peak_end)     # True for each half-hour in the evening peak
-
 #-----------------------------------------------
-# Gas: maximum output (MW)
+# Gas: maximum output and ramp limit (MW)
 #-----------------------------------------------
     gas_max = _user_mw("Gas", "gas")
+    gas_ramp = gas_max * GAS_RAMP_SHARE_PER_MIN[year] * 30     # max increase per half-hour
+
+#-----------------------------------------------
+# Deep storage look-ahead: water to keep for shortfalls forecast over the next 7 days (MWh)
+# Shortfall = demand that must-run, coal at its maximum and gas at its maximum can't cover
+#-----------------------------------------------
+    firm_gap = np.maximum(0, demand - solar_dispatch - wind_dispatch - hydro_dispatch - nuclear_dispatch
+                          - coal_max - gas_max) * INTERVAL_HOURS
+    gap_total = np.concatenate([[0.0], np.cumsum(firm_gap)])        # running total, so any window is one subtraction
+    window_end = np.minimum(np.arange(n) + 1 + PUMPED_HYDRO_LOOKAHEAD_DAYS * 48, n)
+    pumped_keep = gap_total[window_end] - gap_total[np.arange(n) + 1]  # shortfall over the next 7 days
 
 #-----------------------------------------------------------------------
 # Storage helpers: discharge, charge, and where stored energy came from
@@ -178,7 +193,7 @@ def run_dispatch(df, capacity_additions, source_toggles, battery_capacity_mwh, y
         must_run = solar_dispatch[i] + wind_dispatch[i] + hydro_dispatch[i] + nuclear_dispatch[i] + coal_lower
         remaining = demand[i] - must_run        # demand still to be met
 
-# 2. Surplus: refill pumped hydro first (kept full for long shortfalls), then the battery; anything left is curtailed
+# 2. Surplus: refill deep storage first (kept full for long shortfalls), then the battery; anything left is curtailed
         if remaining <= 0:
             surplus = -remaining
 
@@ -205,15 +220,17 @@ def run_dispatch(df, capacity_additions, source_toggles, battery_capacity_mwh, y
             curtailment[i] = surplus        # surplus that couldn't be stored
 
         else:
-# 3. Battery
+# 3. Battery: cheapest storage to run (smallest losses)
             battery_dispatch[i], battery_stored = _discharge(battery_stored, battery_power, remaining)
             remaining -= battery_dispatch[i]
             storage_from_coal[i] += battery_dispatch[i] * battery_coal_share
             storage_from_nuclear[i] += battery_dispatch[i] * battery_nuclear_share
 
-# 4. Pumped hydro, evening peak only
-            if is_peak[i]:
-                pumped_dispatch[i], pumped_stored = _discharge(pumped_stored, pumped_mw, remaining)
+# 4. Deep storage: only the water above the 7-day need
+            if remaining > 0:
+                kept = min(pumped_stored, pumped_keep[i])           # water kept for the week ahead
+                pumped_dispatch[i], usable = _discharge(pumped_stored - kept, pumped_mw, remaining)
+                pumped_stored = usable + kept
                 remaining -= pumped_dispatch[i]
                 storage_from_coal[i] += pumped_dispatch[i] * pumped_coal_share
                 storage_from_nuclear[i] += pumped_dispatch[i] * pumped_nuclear_share
@@ -224,17 +241,19 @@ def run_dispatch(df, capacity_additions, source_toggles, battery_capacity_mwh, y
                 coal_dispatch[i] += extra_coal
                 remaining -= extra_coal
 
-# 6. Gas
+# 6. Gas, up to its maximum and no faster than its ramp-up limit
             if remaining > 0:
-                gas_dispatch[i] = min(remaining, gas_max)
+                gas_upper = gas_max if i == 0 else min(gas_max, gas_dispatch[i - 1] + gas_ramp)
+                gas_dispatch[i] = min(remaining, gas_upper)
                 remaining -= gas_dispatch[i]
 
-# 7. Pumped hydro outside the peak, held in reserve to prevent a shortfall
-            if remaining > 0 and not is_peak[i]:
-                pumped_dispatch[i], pumped_stored = _discharge(pumped_stored, pumped_mw, remaining)
-                remaining -= pumped_dispatch[i]
-                storage_from_coal[i] += pumped_dispatch[i] * pumped_coal_share
-                storage_from_nuclear[i] += pumped_dispatch[i] * pumped_nuclear_share
+# 7. Deep storage reserve: the water kept for the week ahead, used only to prevent a shortfall
+            if remaining > 0:
+                extra, pumped_stored = _discharge(pumped_stored, pumped_mw - pumped_dispatch[i], remaining)
+                pumped_dispatch[i] += extra
+                remaining -= extra
+                storage_from_coal[i] += extra * pumped_coal_share
+                storage_from_nuclear[i] += extra * pumped_nuclear_share
 
 # 8. Anything left is unserved energy
             if remaining > 0:
